@@ -22,7 +22,7 @@ const (
 	DefaultRegion    = "us-west-1"
 )
 
-var logger = log.New()
+var Logger *log.Logger = log.New()
 
 // Use custom types to allow wrapping later if required
 type Client kinesisiface.KinesisAPI
@@ -35,25 +35,24 @@ type Worker interface {
 
 // Manages a single Kinesis stream and a pool of workers, one for each shard.
 type StreamWorker struct {
-	// TODO: pass an aws.Config instead, to allow configuring everything else
-	Region                 string
+	AwsConfig              *aws.Config
 	StreamName             string
 	IteratorType           string
 	StartingSequenceNumber *string
 	BatchSize              int64
 	SleepTime              time.Duration
-	Output                 chan Record
 	Client                 Client
+	workers                []Worker
 
-	workers []Worker
+	// Blocking channel of kinesis Records
+	Output chan Record
+
+	// Non-blocking channel of state updates
+	State chan WorkerState
 }
 
 // Set defaults for all fields, initialize channel and client if not provided
 func (stream *StreamWorker) initialize() error {
-	if stream.Region == "" {
-		stream.Region = DefaultRegion
-	}
-
 	if stream.IteratorType == "" {
 		stream.IteratorType = ShardIteratorTypeLatest
 	}
@@ -70,9 +69,18 @@ func (stream *StreamWorker) initialize() error {
 		stream.Output = make(chan Record)
 	}
 
-	if stream.Client == nil {
-		stream.Client = kinesis.New(&aws.Config{Region: stream.Region})
+	if stream.State == nil {
+		stream.State = make(chan WorkerState)
 	}
+
+	if stream.Client == nil {
+		stream.Client = kinesis.New(stream.AwsConfig)
+	}
+
+	Logger.WithFields(log.Fields{
+		"StreamWorker": stream,
+		"AWS":          stream.AwsConfig,
+	}).Debug("StreamWorker initialized")
 
 	return nil
 }
@@ -91,7 +99,8 @@ func (stream *StreamWorker) Start() error {
 	}
 
 	// Create one worker for each shard in the stream
-	stream.workers = make([]Worker, len(stream_res.StreamDescription.Shards))
+	numWorkers := len(stream_res.StreamDescription.Shards)
+	stream.workers = make([]Worker, numWorkers)
 
 	for i, shard := range stream_res.StreamDescription.Shards {
 		worker, err := NewShardWorker(stream, shard)
@@ -101,7 +110,7 @@ func (stream *StreamWorker) Start() error {
 		stream.workers[i] = worker
 	}
 
-	logger.WithFields(log.Fields{
+	Logger.WithFields(log.Fields{
 		"StreamName": stream.StreamName,
 		"Shards":     len(stream.workers),
 		"Workers":    len(stream.workers),
@@ -125,11 +134,17 @@ func (stream *StreamWorker) Stop() {
 type ShardWorker struct {
 	Stream        *StreamWorker
 	Shard         *kinesis.Shard
+	ShardID       string
 	ShardIterator string
 	done          chan bool
 }
 
-func NewShardWorker(stream *StreamWorker, shard *kinesis.Shard) (Worker, error) {
+type WorkerState struct {
+	ShardID string
+	Lag     int64
+}
+
+func NewShardWorker(stream *StreamWorker, shard *kinesis.Shard) (*ShardWorker, error) {
 	iter_res, err := stream.Client.GetShardIterator(&kinesis.GetShardIteratorInput{
 		StreamName:             &stream.StreamName,
 		ShardID:                shard.ShardID,
@@ -144,6 +159,7 @@ func NewShardWorker(stream *StreamWorker, shard *kinesis.Shard) (Worker, error) 
 	worker := ShardWorker{
 		Stream:        stream,
 		Shard:         shard,
+		ShardID:       *shard.ShardID,
 		ShardIterator: *iter_res.ShardIterator,
 		done:          make(chan bool),
 	}
@@ -163,10 +179,10 @@ func (w *ShardWorker) Stop() {
 func (w *ShardWorker) run() {
 	delayTimer := time.NewTicker(w.Stream.SleepTime)
 
-	logger.WithFields(log.Fields{
-		"ShardID":       *w.Shard.ShardID,
+	Logger.WithFields(log.Fields{
+		"ShardID":       w.ShardID,
 		"ShardIterator": w.ShardIterator,
-	}).Info("ShardWorker starting")
+	}).Debug("ShardWorker starting")
 
 	for {
 		w.step()
@@ -178,8 +194,8 @@ func (w *ShardWorker) run() {
 			continue
 
 		case <-w.done:
-			logger.WithFields(log.Fields{
-				"ShardID": *w.Shard.ShardID,
+			Logger.WithFields(log.Fields{
+				"ShardID": w.ShardID,
 			}).Debug("ShardWorker finishing")
 
 			// Received shutdown message from StreamWorker, finish
@@ -197,7 +213,7 @@ func (w *ShardWorker) step() {
 	})
 
 	if err != nil {
-		logger.WithFields(log.Fields{
+		Logger.WithFields(log.Fields{
 			"Error":         err,
 			"ShardIterator": w.ShardIterator,
 		}).Error("GetRecords API call failed")
@@ -206,8 +222,11 @@ func (w *ShardWorker) step() {
 		return
 	}
 
-	logger.WithFields(log.Fields{
-		"MillisBehindLatest": *records_res.MillisBehindLatest,
+	lag := *records_res.MillisBehindLatest
+	w.updateState(WorkerState{ShardID: w.ShardID, Lag: lag})
+
+	Logger.WithFields(log.Fields{
+		"MillisBehindLatest": lag,
 		"NumRecords":         len(records_res.Records),
 		"ShardIterator":      w.ShardIterator,
 		"NextShardIterator":  *records_res.NextShardIterator,
@@ -222,22 +241,10 @@ func (w *ShardWorker) step() {
 	w.ShardIterator = *records_res.NextShardIterator
 }
 
-// Configure the package's logger
-func SetLogLevel(level string) {
-	switch level {
-	case "DEBUG":
-		logger.Level = log.DebugLevel
-	case "INFO":
-		logger.Level = log.InfoLevel
-	case "WARN":
-		logger.Level = log.WarnLevel
-	case "ERROR":
-		logger.Level = log.ErrorLevel
-	case "PANIC":
-		logger.Level = log.PanicLevel
-	case "FATAL":
-		logger.Level = log.FatalLevel
+func (w *ShardWorker) updateState(state WorkerState) {
+	// Attempt to update state with a non-blocking send on State channel
+	select {
+	case w.Stream.State <- state:
 	default:
-		logger.Level = log.InfoLevel
 	}
 }
